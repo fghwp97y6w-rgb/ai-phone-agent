@@ -5,13 +5,14 @@ import { ElevenLabsClient } from '@elevenlabs/elevenlabs-js';
 import { systemPrompt } from './system-prompt.js';
 import { toolDefinitions, executeTool } from './tools.js';
 
-const CLAUDE_MODEL = 'claude-sonnet-4-6';
-const ELEVENLABS_MODEL = 'eleven_multilingual_v2';
+const CLAUDE_MODEL = 'claude-sonnet-4-5';
+// If Arabic quality regresses, revert to eleven_multilingual_v2
+const ELEVENLABS_MODEL = 'eleven_flash_v2_5';
 const DEEPGRAM_MODEL = 'nova-3';
 
 const APOLOGY_TEXT = "Sorry, I'm having trouble right now. Please call back in a moment. Thank you.";
-const IDLE_NUDGE_MS = 15_000;
-const IDLE_HANGUP_MS = 30_000;
+const IDLE_NUDGE_MS = 25_000;
+const IDLE_HANGUP_MS = 40_000;
 const TWILIO_FRAME_BYTES = 160;
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -44,33 +45,50 @@ export async function handleCallSession(twilioWs) {
   let nudgeTimer = null;
   let hangupTimer = null;
   let callEnded = false;
+  let currentTiming = null;
+  let lastSpeakDurationMs = 0;
 
   const safeLog = (msg, ...args) => {
     const tag = callSid ? callSid.slice(-6) : '?';
     console.log(`[call=${tag}]`, msg, ...args);
   };
 
+  const markTiming = (label, extra = '') => {
+    if (!currentTiming) return;
+    const now = Date.now();
+    const dPrev = now - currentTiming.last;
+    const dStart = now - currentTiming.start;
+    safeLog(`[+${dPrev}ms / +${dStart}ms total] ${label}${extra ? '  ' + extra : ''}`);
+    currentTiming.last = now;
+  };
+
   const sendAudioToTwilio = (audioBuffer) => {
     if (!streamSid || twilioWs.readyState !== WebSocket.OPEN) return;
+    let chunkCount = 0;
     for (let i = 0; i < audioBuffer.length; i += TWILIO_FRAME_BYTES) {
       const chunk = audioBuffer.subarray(i, i + TWILIO_FRAME_BYTES);
+      if (chunkCount === 0) markTiming('twilio_first_media_sent');
       twilioWs.send(JSON.stringify({
         event: 'media',
         streamSid,
         media: { payload: chunk.toString('base64') },
       }));
+      chunkCount++;
     }
+    markTiming('twilio_last_media_sent', `${chunkCount} chunks`);
   };
 
   const speakText = async (text) => {
     if (!text?.trim()) return;
     safeLog('TTS:', text.slice(0, 80));
+    markTiming('elevenlabs_request_sent', `text_len=${text.length}`);
     const audio = await elevenlabs.textToSpeech.convert(process.env.ELEVENLABS_VOICE_ID, {
       text,
       modelId: ELEVENLABS_MODEL,
       outputFormat: 'ulaw_8000',
     });
     const buffer = await collectToBuffer(audio);
+    markTiming('elevenlabs_audio_received', `${buffer.length} bytes`);
     sendAudioToTwilio(buffer);
   };
 
@@ -119,13 +137,17 @@ export async function handleCallSession(twilioWs) {
     isResponding = true;
     try {
       while (!callEnded) {
+        markTiming('claude_request_sent', `history_len=${conversationHistory.length}`);
         const response = await anthropic.messages.create({
           model: CLAUDE_MODEL,
-          max_tokens: 1024,
+          max_tokens: 200,
           system: systemPrompt,
           tools: toolDefinitions,
           messages: conversationHistory,
         });
+        const respTextLen = response.content.filter(b => b.type === 'text').reduce((n, b) => n + b.text.length, 0);
+        const respToolCount = response.content.filter(b => b.type === 'tool_use').length;
+        markTiming('claude_response_received', `stop=${response.stop_reason}, text=${respTextLen}c, tools=${respToolCount}`);
 
         conversationHistory.push({ role: 'assistant', content: response.content });
 
@@ -142,7 +164,9 @@ export async function handleCallSession(twilioWs) {
         for (const tu of toolUses) {
           try {
             safeLog('TOOL CALL:', tu.name, JSON.stringify(tu.input));
+            markTiming(`tool_${tu.name}_called`);
             const result = await executeTool(tu.name, tu.input, { callSid });
+            markTiming(`tool_${tu.name}_result`, 'ok');
             safeLog('TOOL RESULT:', JSON.stringify(result));
             toolResults.push({
               type: 'tool_result',
@@ -200,11 +224,14 @@ export async function handleCallSession(twilioWs) {
       if (data?.type !== 'Results') return;
       const transcript = data?.channel?.alternatives?.[0]?.transcript ?? '';
       if (!transcript || !data.is_final || !data.speech_final) return;
-      safeLog('USER:', transcript);
+      const now = Date.now();
+      currentTiming = { start: now, last: now };
+      safeLog(`turn_start  USER: "${transcript.slice(0, 60)}"`);
       conversationHistory.push({ role: 'user', content: transcript });
       clearTimeout(nudgeTimer);
       clearTimeout(hangupTimer);
       await handleAssistantTurn();
+      currentTiming = null;
     });
 
     deepgramConnection.connect();
